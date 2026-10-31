@@ -333,14 +333,16 @@ impl MfEncoder {
 
     /// Take one encoded access unit from the MFT, renegotiating its output type when it asks
     /// (Intel's MFT does so before its first packet, once it has chosen the stream's parameters).
+    /// After a renegotiation the MFT sends a new METransformHaveOutput for the same packet; an
+    /// asynchronous MFT must not be asked for output without one.
     fn pull(&mut self) -> Result<Option<EncodedPacket>> {
-        for _ in 0..4 {
-            match self.pull_once()? {
-                Pulled::Packet(p) => return Ok(p),
-                Pulled::StreamChange => self.renegotiate()?,
+        match self.pull_once()? {
+            Pulled::Packet(p) => Ok(p),
+            Pulled::StreamChange => {
+                self.renegotiate()?;
+                Ok(None)
             }
         }
-        Err(self.err("the encoder kept changing its output format"))
     }
 
     /// Set the output type the MFT now offers and re-read its output stream info.
