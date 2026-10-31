@@ -1,0 +1,35 @@
+# Fork-only: build the Windows x64 app and CLI from this branch and upload them as an artifact.
+name: Fork Windows build
+
+on:
+  push:
+    branches: [intel-quick-sync]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests (Media Foundation encoder)
+        run: cargo test -p filmcraft-platform --lib media_foundation::encode
+      - name: Clippy (platform crate)
+        run: cargo clippy -p filmcraft-platform --all-targets -- -D warnings
+      - name: Build release
+        run: cargo build --release -p filmcraft -p filmcraft-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filmcraft-windows-x64
+          path: |
+            target/release/filmcraft.exe
+            target/release/filmcraft-cli.exe
