@@ -29,7 +29,7 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Base, eAVEncH264VProfile_High, eAVEncH264VProfile_Main,
 };
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{GUID, Interface};
+use windows::core::Interface;
 
 use super::gpu::ensure_com;
 use super::mft::{MfApi, api, friendly_name};
