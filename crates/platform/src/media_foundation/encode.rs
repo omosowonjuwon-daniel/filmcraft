@@ -21,7 +21,7 @@ use filmcraft_time::FrameRate;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFTransform, METransformDrainComplete, METransformHaveOutput,
-    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
+    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
     MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFMediaType_Video, MFSampleExtension_CleanPoint, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
@@ -119,6 +119,12 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
         }
         Err(why) => declined(&why),
     }
+}
+
+/// What one `ProcessOutput` call gave.
+enum Pulled {
+    Packet(Option<EncodedPacket>),
+    StreamChange,
 }
 
 /// An asynchronous hardware H.264 encoder MFT, configured for one export.
@@ -325,8 +331,33 @@ impl MfEncoder {
         Ok(Some(true))
     }
 
-    /// Take one encoded access unit from the MFT.
+    /// Take one encoded access unit from the MFT, renegotiating its output type when it asks
+    /// (Intel's MFT does so before its first packet, once it has chosen the stream's parameters).
     fn pull(&mut self) -> Result<Option<EncodedPacket>> {
+        for _ in 0..4 {
+            match self.pull_once()? {
+                Pulled::Packet(p) => return Ok(p),
+                Pulled::StreamChange => self.renegotiate()?,
+            }
+        }
+        Err(self.err("the encoder kept changing its output format"))
+    }
+
+    /// Set the output type the MFT now offers and re-read its output stream info.
+    fn renegotiate(&mut self) -> Result<()> {
+        // SAFETY: plain COM calls on live interfaces.
+        unsafe {
+            let t = self.transform.GetOutputAvailableType(0, 0).map_err(|e| self.err(&format!("no output type after a format change: {e}")))?;
+            self.transform.SetOutputType(0, &t, 0).map_err(|e| self.err(&format!("refused its own output type: {e}")))?;
+            let info = self.transform.GetOutputStreamInfo(0).map_err(|e| self.err(&format!("no output stream info: {e}")))?;
+            self.provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+            self.out_size = info.cbSize.max(1 << 20);
+        }
+        log::info!("{}: output format renegotiated", self.name);
+        Ok(())
+    }
+
+    fn pull_once(&mut self) -> Result<Pulled> {
         let given = if self.provides_samples {
             None
         } else {
@@ -343,10 +374,11 @@ impl MfEncoder {
         let (sample, _events) = unsafe { (ManuallyDrop::take(&mut buffers[0].pSample), ManuallyDrop::take(&mut buffers[0].pEvents)) };
         match r {
             Ok(()) => {}
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Pulled::Packet(None)),
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => return Ok(Pulled::StreamChange),
             Err(e) => return Err(self.err(&format!("ProcessOutput failed: {e}"))),
         }
-        let Some(sample) = sample else { return Ok(None) };
+        let Some(sample) = sample else { return Ok(Pulled::Packet(None)) };
         // SAFETY: plain COM calls on live interfaces; the locked block holds `len` readable bytes
         // until `Unlock`, and is copied out before that.
         let (bytes, time, clean) = unsafe {
@@ -371,10 +403,10 @@ impl MfEncoder {
             self.pps = au.pps.clone();
         }
         if au.data.is_empty() {
-            return Ok(None);
+            return Ok(Pulled::Packet(None));
         }
         filmcraft_export::note_hw_encode_frame();
-        Ok(Some(EncodedPacket { data: au.data, key: clean || au.idr, duration: self.cfg.fps.1, composition_offset: 0 }))
+        Ok(Pulled::Packet(Some(EncodedPacket { data: au.data, key: clean || au.idr, duration: self.cfg.fps.1, composition_offset: 0 })))
     }
 
     /// The SPS and PPS from the MFT's current output type (`MF_MT_MPEG_SEQUENCE_HEADER`), for an
